@@ -22,14 +22,10 @@ import asyncio
 import math
 from functools import wraps
 from PIL import Image
-from telegraph import Telegraph
-from telegraph.exceptions import TelegraphException
-
-# --- ИЗМЕНЕНО: Импортируем logging и db ---
 import logging
 import db
 
-# --- ИЗМЕНЕНО: Настройка логирования ---
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -41,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Конфигурация ---
-TOKEN = "7674848541:AAE_BIB_50rQbrGs33RAeeSjG68fcpYo3g8"
+TOKEN = "7674848541:AAE_BIB_50rQbrGs33RAeeSjG68fcpYo3g8"  # ВАЖНО: Храните токен в безопасности
 BASE_URL = 'https://desu.city/manga/api'
 ADMIN_IDS = [6311102512, 390443177]
 
@@ -63,8 +59,6 @@ session.headers.update({
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
-
-telegraph = Telegraph()
 
 
 # --- Состояния FSM ---
@@ -253,7 +247,8 @@ def is_in_favorites(user_id, manga_id):
 # --- Настройки пользователя ---
 def get_user_settings(user_id: int) -> dict:
     all_settings = load_data(SETTINGS_FILE, {})
-    default_settings = {"batch_size": 5, "output_format": "pdf"}
+    # УДАЛЕНО: Настройка output_format
+    default_settings = {"batch_size": 5}
     user_settings = all_settings.get(str(user_id), {})
     default_settings.update(user_settings)
     return default_settings
@@ -368,58 +363,6 @@ def get_mangas_by_genres_and_kinds(genres, kinds="", search="", api_page=1, orde
         return [], {}
 
 
-# --- ИЗМЕНЕНО: Полностью переработана функция для корректной загрузки изображений ---
-async def upload_to_telegraph(manga_name: str, chapter: dict, pages: list, callback: CallbackQuery) -> str | None:
-    progress_message = await bot.send_message(callback.from_user.id,
-                                              f"Загружаю главу {chapter['ch']} в Telegraph (0/{len(pages)})...")
-    try:
-        image_html_tags = []
-        for i, page in enumerate(pages, 1):
-            try:
-                # 1. Скачиваем картинку
-                img_data = download_image(page['img'])
-                # 2. Загружаем ее в Telegraph
-                # Выполняем синхронную блокирующую операцию в отдельном потоке
-                uploaded_files = await asyncio.to_thread(telegraph.upload_file, src=BytesIO(img_data))
-                # 3. Добавляем тег с новой ссылкой
-                image_html_tags.append(f"<img src='{uploaded_files[0]['src']}'/>")
-
-                if i % 5 == 0 or i == len(pages):
-                    await bot.edit_message_text(
-                        f"Загружаю главу {chapter['ch']} в Telegraph ({i}/{len(pages)})...",
-                        chat_id=callback.from_user.id,
-                        message_id=progress_message.message_id
-                    )
-            except Exception as e:
-                logger.error(f"Не удалось загрузить страницу {i} в Telegraph: {e}")
-                image_html_tags.append(f"<p><i>[Ошибка загрузки страницы {i}]</i></p>")
-
-        content = "".join(image_html_tags)
-        title = f"{manga_name} - Глава {chapter['ch']}"
-        author_name = "AniMangaBot"
-
-        response = await asyncio.to_thread(
-            telegraph.create_page,
-            title=title,
-            html_content=content,
-            author_name=author_name
-        )
-
-        await bot.delete_message(chat_id=callback.from_user.id, message_id=progress_message.message_id)
-        return response['url']
-    except TelegraphException as e:
-        logger.error(f"Ошибка Telegraph API при создании страницы: {e}")
-        await bot.edit_message_text("❌ Ошибка при создании страницы Telegraph.",
-                                    chat_id=callback.from_user.id, message_id=progress_message.message_id)
-        return None
-    except Exception as e:
-        logger.error(f"Критическая ошибка в upload_to_telegraph: {e}")
-        if progress_message:
-            await bot.edit_message_text("❌ Произошла ошибка при загрузке в Telegraph.",
-                                        chat_id=callback.from_user.id, message_id=progress_message.message_id)
-        return None
-
-
 async def download_chapter(manga_id: str, chapter: dict, callback: CallbackQuery) -> bytes | None:
     url = f"{BASE_URL}/{manga_id}/chapter/{chapter['id']}"
     progress_message = None
@@ -441,7 +384,17 @@ async def download_chapter(manga_id: str, chapter: dict, callback: CallbackQuery
         images_for_pdf = []
         for i, page in enumerate(pages, 1):
             try:
-                img_data = download_image(page['img'])
+                # API может вернуть как словарь, так и просто строку с URL
+                if isinstance(page, dict):
+                    img_url = page.get('img')
+                else:
+                    img_url = page
+
+                if not img_url:
+                    logger.warning(f"Пустой URL для страницы {i} в главе {chapter['ch']}")
+                    continue
+
+                img_data = download_image(img_url)
                 img = Image.open(BytesIO(img_data))
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
@@ -467,7 +420,7 @@ async def download_chapter(manga_id: str, chapter: dict, callback: CallbackQuery
         await bot.edit_message_text(f"⚙️ Конвертирую {len(images_for_pdf)} страниц в PDF...",
                                     chat_id=callback.from_user.id, message_id=progress_message.message_id)
 
-        pdf_bytes = img2pdf.convert(images_for_pdf)
+        pdf_bytes = await asyncio.to_thread(img2pdf.convert, images_for_pdf)
 
         if len(pdf_bytes) > 50 * 1024 * 1024:
             logger.warning(f"Глава {chapter['ch']} слишком большая (> 50 МБ)")
@@ -511,7 +464,7 @@ async def run_batch_download(callback: CallbackQuery, state: FSMContext, start_i
 
     for i, chapter in enumerate(chapters_to_process):
         is_last = (i == len(chapters_to_process) - 1)
-        await send_chapter_or_telegraph(callback, state, float(chapter['ch']), is_last_in_batch=is_last)
+        await send_chapter_as_pdf(callback, state, float(chapter['ch']), is_last_in_batch=is_last)
         await asyncio.sleep(0.4)
 
 
@@ -545,7 +498,6 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     if is_vip:
         settings = get_user_settings(user_id)
         current_batch_size = settings.get('batch_size', 5)
-        current_format = settings.get('output_format', 'pdf')
 
         sizes = [3, 5, 10]
         batch_buttons = [InlineKeyboardButton(
@@ -555,18 +507,6 @@ def create_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         keyboard.append([InlineKeyboardButton(text="Кол-во глав в пакете:", callback_data="ignore")])
         keyboard.append(batch_buttons)
 
-        format_buttons = [
-            InlineKeyboardButton(
-                text="✅ PDF" if current_format == 'pdf' else "PDF",
-                callback_data="set_format_pdf"
-            ),
-            InlineKeyboardButton(
-                text="✅ Telegraph" if current_format == 'telegraph' else "Telegraph",
-                callback_data="set_format_telegraph"
-            )
-        ]
-        keyboard.append([InlineKeyboardButton(text="Формат выдачи:", callback_data="ignore")])
-        keyboard.append(format_buttons)
     else:
         keyboard.append(
             [InlineKeyboardButton(text="🌟 Купить Premium для доступа к настройкам", callback_data="main_premium")])
@@ -838,18 +778,6 @@ async def handle_set_batch_size(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup(reply_markup=create_settings_keyboard(callback.from_user.id))
 
 
-@dp.callback_query(MangaStates.settings_menu, F.data.startswith("set_format_"))
-async def handle_set_output_format(callback: CallbackQuery, state: FSMContext):
-    if not check_vip_access(callback.from_user.id):
-        await callback.answer("Эта функция доступна только для VIP-пользователей.", show_alert=True)
-        return
-    new_format = callback.data.split("_")[2]
-    save_user_settings(callback.from_user.id, {"output_format": new_format})
-    format_name = "PDF" if new_format == "pdf" else "Telegraph"
-    await callback.answer(f"✅ Формат выдачи изменен на {format_name}.", show_alert=True)
-    await callback.message.edit_reply_markup(reply_markup=create_settings_keyboard(callback.from_user.id))
-
-
 @dp.message(Command("premium"))
 @subscription_wrapper
 async def cmd_premium(message: types.Message, state: FSMContext):
@@ -864,8 +792,7 @@ async def show_premium_menu(message: types.Message, state: FSMContext, is_callba
             "<b>Что вы получаете:</b>\n"
             "✅ <b>Пакетная загрузка</b> — скачивайте сразу по несколько глав.\n"
             "✅ <b>Быстрая навигация</b> — переключайтесь между главами прямо под файлом.\n"
-            "✅ <b>Настройка скачивания</b> — выберите, сколько глав скачивать за раз.\n"
-            "✅ <b>Формат Telegraph</b> — читайте мангу прямо в браузере без скачивания файлов.\n\n")
+            "✅ <b>Настройка скачивания</b> — выберите, сколько глав скачивать за раз.\n\n")
     if check_vip_access(user_id):
         expiry_date = get_vip_expiry_date(user_id)
         text += (f"✅ <b>У вас уже есть активная подписка!</b>\n"
@@ -905,7 +832,7 @@ async def handle_buy_premium(callback: CallbackQuery):
         title=plan["title"],
         description=f"VIP-доступ к функциям бота на {plan['days']} дней.",
         payload=plan_key,
-        provider_token="",
+        provider_token="",  # ВАЖНО: Укажите ваш provider_token
         currency="XTR",
         prices=[LabeledPrice(label=plan["title"], amount=plan["stars"])]
     )
@@ -1133,11 +1060,10 @@ async def handle_manga_selection(callback: types.CallbackQuery, state: FSMContex
         await callback.answer()
 
 
-async def send_chapter_or_telegraph(callback: types.CallbackQuery, state: FSMContext, chapter_num_to_dl: float,
-                                    is_last_in_batch: bool = True):
+async def send_chapter_as_pdf(callback: types.CallbackQuery, state: FSMContext, chapter_num_to_dl: float,
+                              is_last_in_batch: bool = True):
     user_id = callback.from_user.id
-    settings = get_user_settings(user_id)
-    output_format = 'telegraph' if settings.get('output_format') == 'telegraph' and check_vip_access(user_id) else 'pdf'
+    output_format = 'pdf'  # Формат теперь всегда PDF
 
     data = await state.get_data()
     manga_id = data.get('manga_id')
@@ -1165,64 +1091,35 @@ async def send_chapter_or_telegraph(callback: types.CallbackQuery, state: FSMCon
     if cached_chapter:
         logger.info(f"Cache HIT: Глава {manga_id}/{chapter_num_to_dl} ({output_format}) найдена в кэше.")
         try:
-            if output_format == 'pdf':
-                sent_msg = await bot.send_document(user_id, document=cached_chapter['file_id'], reply_markup=keyboard)
-            else:  # telegraph
-                sent_msg = await bot.send_message(user_id,
-                                                  f"📖 <b>{get_display_name(data['info'])} - Глава {chapter_num_to_dl}</b>\n\n<a href='{cached_chapter['file_id']}'>Читать в Telegraph</a>",
-                                                  reply_markup=keyboard, disable_web_page_preview=False)
+            sent_msg = await bot.send_document(user_id, document=cached_chapter['file_id'], reply_markup=keyboard)
             if sent_msg and is_last_in_batch: await state.update_data(last_doc_msg_id=sent_msg.message_id)
             return
         except (TelegramBadRequest, TelegramForbiddenError) as e:
             logger.warning(
-                f"Кэшированный file_id для главы {chapter_num_to_dl} невалиден (Ошибка: {e}). Файл НЕ будет скачиваться заново.")
-            await bot.send_message(user_id, "Кэш для этой главы устарел. Попробуйте запросить её ещё раз.",
-                                   reply_markup=keyboard)
-            return
+                f"Кэшированный file_id для главы {chapter_num_to_dl} невалиден (Ошибка: {e}). Файл будет скачан заново.")
+            await db.delete_chapter_from_cache(manga_id, str(chapter_num_to_dl), output_format)
 
-    logger.info(
-        f"Cache MISS: Глава {manga_id}/{chapter_num_to_dl} ({output_format}) не найдена в кэше. Начинаю загрузку.")
-    if output_format == 'pdf':
-        pdf_bytes = await download_chapter(manga_id, chapter_to_dl, callback)
-        if pdf_bytes:
-            filename = f"{get_display_name(data['info']).replace(' ', '_')}_ch_{chapter_to_dl['ch']}.pdf"
-            try:
-                file_to_send_user = BufferedInputFile(pdf_bytes, filename)
-                sent_msg = await bot.send_document(user_id, document=file_to_send_user, reply_markup=keyboard)
+    logger.info(f"Cache MISS: Глава {manga_id}/{chapter_num_to_dl} ({output_format}) не найдена. Начинаю загрузку.")
 
-                if CHANNEL_ID and sent_msg and sent_msg.document:
-                    pdf_bytes_rewound = BytesIO(pdf_bytes)
-                    file_to_send_cache = BufferedInputFile(pdf_bytes_rewound.read(), filename)
-                    sent_to_channel_msg = await bot.send_document(CHANNEL_ID, file_to_send_cache)
-                    if sent_to_channel_msg.document:
-                        cache_doc = sent_to_channel_msg.document
-                        await db.add_chapter_to_cache(manga_id, str(chapter_num_to_dl), 'pdf', cache_doc.file_id,
-                                                      cache_doc.file_unique_id)
-                        logger.info(f"Cache SAVE: Глава {manga_id}/{chapter_num_to_dl} (PDF) сохранена в кэш.")
-            except Exception as e:
-                logger.error(f"Ошибка при отправке/кэшировании PDF {chapter_num_to_dl}: {e}")
-                await bot.send_message(user_id, f"❌ Ошибка при отправке главы {chapter_num_to_dl}.")
+    pdf_bytes = await download_chapter(manga_id, chapter_to_dl, callback)
+    if pdf_bytes:
+        filename = f"{get_display_name(data['info']).replace(' ', '_')}_ch_{chapter_to_dl['ch']}.pdf"
+        try:
+            file_to_send_user = BufferedInputFile(pdf_bytes, filename)
+            sent_msg = await bot.send_document(user_id, document=file_to_send_user, reply_markup=keyboard)
 
-    else:  # output_format == 'telegraph'
-        url_api = f"{BASE_URL}/{manga_id}/chapter/{chapter_to_dl['id']}"
-        logger.info(f"API Request: get pages for Telegraph (manga_id: {manga_id}, chapter: {chapter_to_dl['id']})")
-        resp_api = session.get(url_api).json()
-        pages = resp_api.get('response', {}).get('pages', {}).get('list', [])
-
-        if not pages:
-            logger.warning(
-                f"Не удалось получить страницы для Telegraph: manga_id {manga_id}, chapter {chapter_to_dl['ch']}")
-            await bot.send_message(user_id, "Не удалось получить страницы для создания Telegraph-статьи.")
-            return
-
-        telegraph_url = await upload_to_telegraph(get_display_name(data['info']), chapter_to_dl, pages, callback)
-        if telegraph_url:
-            sent_msg = await bot.send_message(user_id,
-                                              f"📖 <b>{get_display_name(data['info'])} - Глава {chapter_num_to_dl}</b>\n\n<a href='{telegraph_url}'>Читать в Telegraph</a>",
-                                              reply_markup=keyboard, disable_web_page_preview=False)
-            await db.add_chapter_to_cache(manga_id, str(chapter_num_to_dl), 'telegraph', telegraph_url,
-                                          f"telegraph_{manga_id}_{chapter_num_to_dl}")
-            logger.info(f"Cache SAVE: Глава {manga_id}/{chapter_num_to_dl} (Telegraph) сохранена в кэш.")
+            if CHANNEL_ID and sent_msg and sent_msg.document:
+                pdf_bytes_rewound = BytesIO(pdf_bytes)
+                file_to_send_cache = BufferedInputFile(pdf_bytes_rewound.read(), filename)
+                sent_to_channel_msg = await bot.send_document(CHANNEL_ID, file_to_send_cache)
+                if sent_to_channel_msg.document:
+                    cache_doc = sent_to_channel_msg.document
+                    await db.add_chapter_to_cache(manga_id, str(chapter_num_to_dl), output_format, cache_doc.file_id,
+                                                  cache_doc.file_unique_id)
+                    logger.info(f"Cache SAVE: Глава {manga_id}/{chapter_num_to_dl} (PDF) сохранена в кэш.")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке/кэшировании PDF {chapter_num_to_dl}: {e}")
+            await bot.send_message(user_id, f"❌ Ошибка при отправке главы {chapter_num_to_dl}.")
 
     if sent_msg and is_last_in_batch:
         await state.update_data(last_doc_msg_id=sent_msg.message_id)
@@ -1238,7 +1135,7 @@ async def handle_vip_navigation(callback: CallbackQuery, state: FSMContext):
     action_full = callback.data
     if action_full.startswith("doc_nav_"):
         chapter_num_to_send = float(action_full.split("_")[2])
-        await send_chapter_or_telegraph(callback, state, chapter_num_to_send)
+        await send_chapter_as_pdf(callback, state, chapter_num_to_send)
     elif action_full.startswith("batch_dl_"):
         start_index = int(action_full.split("_")[2])
         asyncio.create_task(run_batch_download(callback, state, start_index))
@@ -1270,7 +1167,7 @@ async def handle_chapter_grid_actions(callback: types.CallbackQuery, state: FSMC
         await callback.answer("Начинаю загрузку...")
         chapter_num = float(action_full.split("_")[1])
         await state.update_data(last_doc_msg_id=None)
-        await send_chapter_or_telegraph(callback, state, chapter_num)
+        await send_chapter_as_pdf(callback, state, chapter_num)
     elif action_full == "back_to_grid":
         await callback.answer()
         try:
@@ -1371,7 +1268,7 @@ async def handle_mailing_content(message: types.Message, state: FSMContext):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Пропустить кнопки", callback_data="mailing_skip_buttons")]])
     await message.answer(
-        "📎 Контент сохранен! Теперь отправьте кнопки в формате:\n\n<code>Текст - https://ссылка</code>\n\nИли нажмите 'Пропустить'",
+        "📎 Контент сохранен! Теперь отправьте кнопки в формате:\n\n<code>Текст - https://ссылка</code>\n\nИли нажмите 'Пропустить'.",
         reply_markup=keyboard)
     await state.set_state(AdminStates.mailing_get_buttons)
 
@@ -1495,29 +1392,8 @@ async def start_broadcast(admin_id: int, state: FSMContext):
 
 
 async def main():
-    global telegraph
-
     await db.init_db()
     logger.info("База данных инициализирована.")
-
-    access_token = await db.load_telegraph_token()
-    if not access_token:
-        try:
-            account = await asyncio.to_thread(Telegraph().create_account, short_name='AniMangaBot')
-            access_token = account['access_token']
-            await db.save_telegraph_token(access_token)
-            logger.info("Создан новый аккаунт Telegraph и сохранен токен в БД.")
-        except Exception as e:
-            logger.critical(f"Не удалось создать аккаунт Telegraph: {e}", exc_info=True)
-            return
-
-    telegraph = Telegraph(access_token=access_token)
-
-    try:
-        await asyncio.to_thread(telegraph.get_account_info)
-        logger.info("Аккаунт Telegraph успешно подключен.")
-    except Exception as e:
-        logger.error(f"Ошибка подключения к Telegraph: {e}")
 
     logger.info("Бот запущен...")
     await bot.delete_webhook(drop_pending_updates=True)
